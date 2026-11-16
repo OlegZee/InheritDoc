@@ -72,12 +72,13 @@ internal class InheritDocProcessor
 
 		static XDocument loadDoc(string path)
 		{
-			using var stmdoc = File.Open(path, FileMode.Open);
+			using var stmdoc = File.OpenRead(path);
 			return XDocument.Load(stmdoc, LoadOptions.PreserveWhitespace | LoadOptions.SetLineInfo);
 		}
 
 		var doc = loadDoc(docPath);
 		var docMembers = doc.Root.Element(DocElementNames.Members);
+		var docIndex = new DocIndex(docMembers);
 		int beforeCount = docMembers.Descendants(DocElementNames.InheritDoc).Count();
 
 		if (beforeCount == 0 && trimLevel == ApiLevel.None)
@@ -93,19 +94,20 @@ internal class InheritDocProcessor
 			.ToList()
 		;
 
-		var docMap = generateDocMap(types, docMembers, trimLevel, logger);
+		var docMap = generateDocMap(types, docMembers, docIndex, trimLevel, logger);
 		var docCref = docMembers.Elements(DocElementNames.Member).Where(m => !m.HasAttribute(DocAttributeNames._trimmed)).Descendants(DocElementNames.InheritDoc).Select(i => (string)i.Attribute(DocAttributeNames.Cref)).Where(isValidCref);
 		var asmTypes = types.Select(t => t.GetDocID()).ToHashSet();
 
 		var refCref = docMap.Values.SelectMany(v => v.Select(l => l.Cref)).Concat(docCref).Where(c => !asmTypes.Contains(getTypeIDFromDocID(c))).ToHashSet();
 		var refDocs = getRefDocs(refPaths, addPaths, refCref, logger);
 		logger.Write(ILogger.Severity.Diag, "External ref docs found: " + refDocs.Root.Elements(DocElementNames.Member).Count().ToString());
+		var refIndex = new DocIndex(refDocs.Root);
 
 		beforeCount = docMembers.Descendants(DocElementNames.InheritDoc).Count(dm => !dm.Ancestors(DocElementNames.Member).Any(m => m.HasAttribute(DocAttributeNames._trimmed) || m.HasAttribute(DocAttributeNames._gencode)));
 
 		var mem = default(XElement);
 		while ((mem = docMembers.Elements(DocElementNames.Member).FirstOrDefault(isInheritDocCandidate)) is not null)
-			replaceInheritDoc(docPath, mem, docMap, docMembers, refDocs, logger);
+			replaceInheritDoc(docPath, mem, docMap, docIndex, refIndex, logger);
 
 		var totrim = docMembers.Elements(DocElementNames.Member).Where(m => m.HasAttribute(DocAttributeNames._trimmed) || (m.HasAttribute(DocAttributeNames._gencode) && !m.Elements().Any(e => e.Name != DocElementNames.InheritDoc))).ToList();
 		int trimCount = totrim.Count;
@@ -135,7 +137,7 @@ internal class InheritDocProcessor
 		return (beforeCount - afterCount, beforeCount, trimCount);
 	}
 
-	private static IDictionary<string, IEnumerable<DocMatch>> generateDocMap(IList<TypeDefinition> types, XElement docMembers, ApiLevel trimLevel, ILogger logger)
+	private static IDictionary<string, IEnumerable<DocMatch>> generateDocMap(IList<TypeDefinition> types, XElement docMembers, DocIndex docIndex, ApiLevel trimLevel, ILogger logger)
 	{
 		var docMap = new Dictionary<string, IEnumerable<DocMatch>>();
 		var nodeComparer = new XNodeEqualityComparer();
@@ -143,7 +145,7 @@ internal class InheritDocProcessor
 		foreach (var t in types)
 		{
 			string typeID = t.GetDocID();
-			var typeDocs = findDocsByID(docMembers, typeID);
+			var typeDocs = findDocsByID(docIndex, typeID);
 
 			if (t.IsGeneratedCode())
 			{
@@ -153,6 +155,8 @@ internal class InheritDocProcessor
 				{
 					foreach (var td in typeDocs)
 						td.SetAttributeValue(DocAttributeNames.Name, "N:" + t.Namespace);
+
+					docIndex.Invalidate();
 
 					continue;
 				}
@@ -198,23 +202,26 @@ internal class InheritDocProcessor
 
 				// If no docs for public explicit interface implementation, inject them
 				// including the whitespace they would have had if they had been there.
-				if (idx == 0 && (om?.DeclaringType.GetApiLevel() ?? ApiLevel.None) > trimLevel && t.GetApiLevel() > trimLevel && !findDocsByID(docMembers, memID).Any())
+				if (idx == 0 && (om?.DeclaringType.GetApiLevel() ?? ApiLevel.None) > trimLevel && t.GetApiLevel() > trimLevel && !findDocsByID(docIndex, memID).Any())
 				{
 					if (docMembers.LastNode.IsWhiteSpace())
 						docMembers.LastNode.Remove();
 
+					var gen = new XElement(DocElementNames.Member,
+						new XAttribute(DocAttributeNames.Name, memID),
+						new XAttribute(DocAttributeNames._gencode, true),
+						new XText("\n            "), new XElement(DocElementNames.InheritDoc),
+						new XText("\n        "));
+
 					docMembers.Add(
 						new XText("\n        "),
-							new XElement(DocElementNames.Member,
-								new XAttribute(DocAttributeNames.Name, memID),
-								new XAttribute(DocAttributeNames._gencode, true),
-								new XText("\n            "), new XElement(DocElementNames.InheritDoc),
-							new XText("\n        ")),
+							gen,
 						new XText("\n    ")
 					);
+					docIndex.Add(gen);
 				}
 
-				var methDocs = findDocsByID(docMembers, memID);
+				var methDocs = findDocsByID(docIndex, memID);
 				if ((om?.DeclaringType.GetApiLevel() ?? m.GetApiLevel()) <= trimLevel)
 				{
 					foreach (var md in methDocs)
@@ -234,6 +241,8 @@ internal class InheritDocProcessor
 					{
 						var typeDoc = typeDocs.First();
 						var ctorDoc = methDocs.First();
+						// Renamed only for the comparison below and restored before any lookup by typeID: the index is not
+						// updated (DocIndex.Find checks the current name, so a lookup by memID meanwhile misses it, as before).
 						ctorDoc.SetAttributeValue(DocAttributeNames.Name, typeID);
 
 						if (nodeComparer.Equals(typeDoc, ctorDoc))
@@ -242,7 +251,7 @@ internal class InheritDocProcessor
 							if (ctorDoc.Elements(DocElementNames.InheritDoc).Any())
 							{
 								string cref = typeID;
-								if (m.GetBaseConstructor() is MethodDefinition bc && bc.GetDocID().SelectMany(d => findDocsByID(docMembers, d)).FirstOrDefault() is XElement bcd)
+								if (m.GetBaseConstructor() is MethodDefinition bc && bc.GetDocID().SelectMany(d => findDocsByID(docIndex, d)).FirstOrDefault() is XElement bcd)
 									cref = (string)bcd.Attribute(DocAttributeNames.Name);
 
 								foreach (var d in ctorDoc.Elements(DocElementNames.InheritDoc).Where(i => !i.HasAttribute(DocAttributeNames.Cref)))
@@ -290,14 +299,14 @@ internal class InheritDocProcessor
 				}
 			}
 
-			foreach (var fd in t.Fields.Where(f => f.GetApiLevel() <= trimLevel).SelectMany(f => f.GetDocID().SelectMany(d => findDocsByID(docMembers, d))))
+			foreach (var fd in t.Fields.Where(f => f.GetApiLevel() <= trimLevel).SelectMany(f => f.GetDocID().SelectMany(d => findDocsByID(docIndex, d))))
 				fd.SetAttributeValue(DocAttributeNames._trimmed, true);
 		}
 
 		return docMap;
 	}
 
-	private static void replaceInheritDoc(string file, XElement mem, IDictionary<string, IEnumerable<DocMatch>> docMap, XElement members, XDocument refDocs, ILogger logger)
+	private static void replaceInheritDoc(string file, XElement mem, IDictionary<string, IEnumerable<DocMatch>> docMap, DocIndex members, DocIndex refDocs, ILogger logger)
 	{
 		if (mem.HasAttribute(DocAttributeNames._visited))
 			return;
@@ -319,7 +328,7 @@ internal class InheritDocProcessor
 
 			var dm = dml?.FirstOrDefault(d => d.Cref == cref) ?? new DocMatch(cref!);
 
-			var doc = findDocsByID(refDocs.Root, cref!).FirstOrDefault();
+			var doc = findDocsByID(refDocs, cref!).FirstOrDefault();
 			if (doc is not null)
 			{
 				inheritDocs(file, memID, inh, doc, dm, logger);
@@ -567,7 +576,61 @@ internal class InheritDocProcessor
 		return "T" + docID.Substring(1, lastDot - 1);
 	}
 
-	private static IEnumerable<XElement> findDocsByID(XElement container, string docID) => container.Elements(DocElementNames.Member).Where(m => (string)m.Attribute(DocAttributeNames.Name) == docID);
+	private static IEnumerable<XElement> findDocsByID(DocIndex index, string docID) => index.Find(docID);
+
+	// The <member> elements of a container by their name attribute, in document order: what a scan of
+	// container.Elements(member) filtered by name finds, without the scan (one scan per type, method and field
+	// made the task quadratic in the members). Lazy like that scan: the lookup happens when the result is
+	// enumerated. A found element is checked against its current name and parent, so an element renamed or
+	// removed since the index was built is not returned under its old name; an element that gets a name
+	// (an added member, the namespace rename) has to be reported with Add or Invalidate.
+	private sealed class DocIndex(XElement container)
+	{
+		private Dictionary<string, List<XElement>>? map;
+
+		private Dictionary<string, List<XElement>> build()
+		{
+			var dict = new Dictionary<string, List<XElement>>(StringComparer.Ordinal);
+			foreach (var m in container.Elements(DocElementNames.Member))
+				add(dict, m);
+
+			return dict;
+		}
+
+		private static void add(Dictionary<string, List<XElement>> dict, XElement m)
+		{
+			string? name = (string)m.Attribute(DocAttributeNames.Name);
+			if (name is null)
+				return;
+
+			if (!dict.TryGetValue(name, out var list))
+				dict.Add(name, list = new List<XElement>(1));
+
+			list.Add(m);
+		}
+
+		// m has just been added as the container's last member
+		public void Add(XElement m)
+		{
+			if (map is not null)
+				add(map, m);
+		}
+
+		public void Invalidate() => map = null;
+
+		public IEnumerable<XElement> Find(string docID)
+		{
+			if (!(map ??= build()).TryGetValue(docID, out var list))
+				yield break;
+
+			for (int i = 0; i < list.Count; i++)
+			{
+				var m = list[i];
+				if (m.Parent == container && (string)m.Attribute(DocAttributeNames.Name) == docID)
+					yield return m;
+			}
+		}
+	}
 
 	private class DocMatch(string cref)
 	{
